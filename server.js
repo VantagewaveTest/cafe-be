@@ -30,6 +30,30 @@ function saveOrders() {
   fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
 }
 
+// Role-scoped order visibility: each role only gets the fields it is allowed to see.
+function sanitizeOrder(order, role) {
+  if (role === 'chef') {
+    // Chef sees WHAT to cook and WHERE (table), but never money or customer identity.
+    return {
+      orderId: order.orderId,
+      tableNumber: order.tableNumber || null,
+      items: order.items.map(i => ({ id: i.id, name: i.name, quantity: i.quantity, prepTime: i.prepTime })),
+      status: order.status,
+      totalPrepTime: order.totalPrepTime,
+      createdAt: order.createdAt
+    };
+  }
+  // Customer sees THEIR order (items, price, status, ETA) but never chef/staff details.
+  return {
+    orderId: order.orderId,
+    items: order.items.map(i => ({ name: i.name, quantity: i.quantity, price: i.price })),
+    totalAmount: order.totalAmount,
+    status: order.status,
+    totalPrepTime: order.totalPrepTime,
+    createdAt: order.createdAt
+  };
+}
+
 const server = http.createServer((req, res) => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -53,12 +77,18 @@ const server = http.createServer((req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       try {
-        const { items, totalAmount } = JSON.parse(body);
+        const { items, totalAmount, tableNumber, paymentMethod } = JSON.parse(body);
         if (!items || !Array.isArray(items) || items.length === 0) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, message: 'Cart is empty or invalid items.' }));
           return;
         }
+
+        const allowedPayments = ['card', 'upi', 'cash'];
+        const cleanTable = tableNumber !== undefined && tableNumber !== null && String(tableNumber).trim() !== ''
+          ? String(tableNumber).trim().slice(0, 20)
+          : null;
+        const cleanPayment = allowedPayments.includes(paymentMethod) ? paymentMethod : null;
 
         let totalPrepTime = 0;
         const validatedItems = items.map(cartItem => {
@@ -80,6 +110,8 @@ const server = http.createServer((req, res) => {
           items: validatedItems,
           totalAmount,
           totalPrepTime,
+          tableNumber: cleanTable,
+          paymentMethod: cleanPayment,
           status: 'pending',
           createdAt: new Date().toISOString()
         };
@@ -100,6 +132,46 @@ const server = http.createServer((req, res) => {
       }
     });
   } 
+  else if (req.method === 'GET' && url.pathname === '/api/orders') {
+    // Role-scoped list view. Customers cannot browse; they must use GET /api/orders/:id.
+    const role = url.searchParams.get('role');
+    if (role === 'chef') {
+      const kitchenOrders = orders
+        .filter(o => ['pending', 'preparing'].includes(o.status))
+        .map(o => sanitizeOrder(o, 'chef'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, role: 'chef', orders: kitchenOrders }));
+    } else if (role === 'customer') {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: false,
+        message: 'Customers can only view their own order via GET /api/orders/:orderId?role=customer'
+      }));
+    } else {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unknown role. Allowed roles: chef, customer.' }));
+    }
+  }
+  else if (req.method === 'GET' && url.pathname.startsWith('/api/orders/')) {
+    const orderId = url.pathname.slice('/api/orders/'.length);
+    const role = url.searchParams.get('role');
+
+    if (role !== 'customer' && role !== 'chef') {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unknown role. Allowed roles: customer, chef.' }));
+      return;
+    }
+
+    const order = orders.find(o => o.orderId === orderId);
+    if (!order) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Order not found.' }));
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, role, order: sanitizeOrder(order, role) }));
+  }
   else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: false, message: 'Not Found' }));
