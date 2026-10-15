@@ -9,12 +9,12 @@ const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
 const LOW_STOCK_THRESHOLD = 3;
 
 const MENU = [
-  { id: 'c1', name: 'Artisanal Espresso', category: 'Coffees', price: 3.50, prepTime: 5, stock: 12, description: 'Rich, bold single origin espresso shot.', image: '\u2615' },
+  { id: 'c1', name: 'Artisanal Espresso', category: 'Coffees', price: 3.50, prepTime: 5, stock: 0, description: 'Rich, bold single origin espresso shot.', image: '\u2615' },
   { id: 'c2', name: 'Caramel Macchiato', category: 'Coffees', price: 4.50, prepTime: 7, stock: 8, description: 'Espresso with vanilla, steamed milk, and caramel drizzle.', image: '\u2615' },
   { id: 'c3', name: 'Iced Cold Brew', category: 'Coffees', price: 4.00, prepTime: 6, stock: 6, description: 'Steeped for 24 hours, smooth and refreshing over ice.', image: '\u2615' },
   { id: 'c4', name: 'Classic Cappuccino', category: 'Coffees', price: 4.25, prepTime: 6, stock: 14, description: 'Equal parts espresso, steamed milk and cloud foam.', image: '\u2615' },
   { id: 'c5', name: 'Flat White', category: 'Coffees', price: 4.00, prepTime: 5, stock: 14, description: 'Silky microfoam over a rich double ristretto.', image: '\u2615' },
-  { id: 'c6', name: 'Caffe Mocha', category: 'Coffees', price: 4.75, prepTime: 7, stock: 10, description: 'Chocolate and espresso blended with steamed milk.', image: '\u2615' },
+  { id: 'c6', name: 'Caffe Mocha', category: 'Coffees', price: 4.75, prepTime: 7, stock: 0, description: 'Chocolate and espresso blended with steamed milk.', image: '\u2615' },
   { id: 'c7', name: 'Americano', category: 'Coffees', price: 3.00, prepTime: 4, stock: 20, description: 'Espresso shots topped with hot water.', image: '\u2615' },
   { id: 't1', name: 'Masala Chai', category: 'Teas', price: 3.00, prepTime: 6, stock: 12, description: 'Spiced black tea brewed with cardamom, ginger and milk.', image: '\uD83C\uDF75' },
   { id: 't2', name: 'Jasmine Green Tea', category: 'Teas', price: 3.25, prepTime: 3, stock: 15, description: 'Light floral jasmine green tea.', image: '\uD83C\uDF75' },
