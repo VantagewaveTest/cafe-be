@@ -8,6 +8,7 @@ const ORDERS_FILE = path.join(__dirname, 'orders.json');
 const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
 const INVENTORY_FILE = path.join(__dirname, 'inventory.json');
 const LOW_STOCK_THRESHOLD = 3;
+const MAX_STOCK = 30;
 
 const MENU = [
   { id: 'c1', name: 'Artisanal Espresso', category: 'Coffees', price: 3.50, prepTime: 5, stock: 0, description: 'Rich, bold single origin espresso shot.', image: '\u2615' },
@@ -34,27 +35,63 @@ const MENU = [
   { id: 's2', name: 'Chicken Caesar Wrap', category: 'Sandwiches', price: 6.25, prepTime: 10, stock: 7, description: 'Wraps of Caesar-grilled chicken, lettuce and parmesan.', image: '\uD83E\uDD6A' }
 ];
 
+// Each menu item starts fully stocked up to the per-item cap.
+MENU.forEach(item => { item.stock = MAX_STOCK; });
+
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_DEV = NODE_ENV === 'development';
-const DEV_CHEF_USER = 'chef';
-const DEV_CHEF_PASSWORD = 'chef123';
 const DEV_TOKEN_SECRET = 'cafe-demo-secret-change-me';
-const CHEF_USER = process.env.CHEF_USERNAME || (IS_DEV ? DEV_CHEF_USER : '');
-const CHEF_PASSWORD = process.env.CHEF_PASSWORD || (IS_DEV ? DEV_CHEF_PASSWORD : '');
+const DEV_CHEF_IDS = ['01', '02', '03', '04', '05', '06'];
+
+// Build the six demo chef accounts (chef01..chef06 with ids 01..06) for local dev only.
+function buildDevChefAccounts() {
+  return DEV_CHEF_IDS.map(id => ({ username: 'chef' + id, password: id }));
+}
+
+// Chef accounts come from CHEF_ACCOUNTS (JSON array of { username, password }).
+// They are never returned to the frontend; only the authenticated username is.
+function parseChefAccounts(raw) {
+  if (!raw) return null;
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (_) { return null; }
+  if (!Array.isArray(parsed)) return null;
+  const list = parsed
+    .map(entry => ({
+      username: String((entry && entry.username) || '').trim(),
+      password: String((entry && entry.password) || '')
+    }))
+    .filter(c => c.username && c.password);
+  return list.length ? list : null;
+}
+
+const ENV_CHEF_ACCOUNTS = parseChefAccounts(process.env.CHEF_ACCOUNTS);
+const CHEF_ACCOUNTS = ENV_CHEF_ACCOUNTS || (IS_DEV ? buildDevChefAccounts() : []);
 const TOKEN_SECRET = process.env.CHEF_TOKEN_SECRET || (IS_DEV ? DEV_TOKEN_SECRET : '');
+
+function findChef(username) {
+  const u = String(username || '').trim().toLowerCase();
+  if (!u) return null;
+  return CHEF_ACCOUNTS.find(c => c.username.toLowerCase() === u) || null;
+}
+
+function authenticateChef(username, password) {
+  const chef = findChef(username);
+  if (!chef) return null;
+  return chef.password === String(password) ? chef : null;
+}
+
 if (!IS_DEV) {
-  const unsafe =
-    !CHEF_USER || !CHEF_PASSWORD || !TOKEN_SECRET ||
-    CHEF_USER === DEV_CHEF_USER ||
-    CHEF_PASSWORD === DEV_CHEF_PASSWORD ||
-    TOKEN_SECRET === DEV_TOKEN_SECRET;
+  const unsafe = !CHEF_ACCOUNTS.length || !TOKEN_SECRET || TOKEN_SECRET === DEV_TOKEN_SECRET;
   if (unsafe) {
-    console.error('Refusing to start: set CHEF_USERNAME, CHEF_PASSWORD and CHEF_TOKEN_SECRET for non-development environments.');
+    console.error('Refusing to start: set CHEF_ACCOUNTS and CHEF_TOKEN_SECRET for non-development environments.');
     process.exit(1);
   }
 }
-if (IS_DEV && !process.env.CHEF_PASSWORD) {
-  console.warn('[dev] Using default chef credentials. Override via CHEF_USERNAME/CHEF_PASSWORD/CHEF_TOKEN_SECRET.');
+if (IS_DEV && !ENV_CHEF_ACCOUNTS) {
+  console.warn('[dev] Using default chef accounts (chef01..chef06). Override via CHEF_ACCOUNTS.');
+}
+if (IS_DEV && !process.env.CHEF_TOKEN_SECRET) {
+  console.warn('[dev] Using default token secret. Override via CHEF_TOKEN_SECRET.');
 }
 const TOKEN_TTL_MS = 60 * 60 * 1000;
 
@@ -108,7 +145,7 @@ function loadInventory() {
         for (const it of data.items) {
           const m = MENU.find(x => String(x.id) === String(it.id));
           if (m && Number.isFinite(Number(it.stock))) {
-            m.stock = Math.max(0, Math.min(999, Number(it.stock)));
+            m.stock = Math.max(0, Math.min(MAX_STOCK, Number(it.stock)));
           }
         }
       }
@@ -144,14 +181,15 @@ function findMenu(id) { return MENU.find(item => item.id === id); }
 function replenish(items) {
   (items || []).forEach(item => {
     const menu = findMenu(item.id);
-    if (menu) menu.stock = Math.min(999, menu.stock + (item.quantity || 0));
+    if (menu) menu.stock = Math.min(MAX_STOCK, menu.stock + (item.quantity || 0));
   });
 }
 
 function b64(text) { return Buffer.from(text, 'utf8').toString('base64url'); }
 
-function signToken() {
-  const body = b64(JSON.stringify({ user: CHEF_USER, iat: Date.now(), exp: Date.now() + TOKEN_TTL_MS }));
+function signToken(username) {
+  const user = String(username || '').trim();
+  const body = b64(JSON.stringify({ user, iat: Date.now(), exp: Date.now() + TOKEN_TTL_MS }));
   const signature = crypto.createHmac('sha256', TOKEN_SECRET).update(body).digest('base64url');
   return `${body}.${signature}`;
 }
@@ -167,7 +205,7 @@ function verifyToken(token) {
   }
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    return payload.user === CHEF_USER && Number(payload.exp) > Date.now();
+    return !!findChef(payload.user) && Number(payload.exp) > Date.now();
   } catch (_) {
     return false;
   }
@@ -473,7 +511,7 @@ function route(req, res) {
 
       for (const line of bill.lineItems) {
         const menu = MENU.find(m => m.id === line.id);
-        menu.stock -= line.quantity;
+        menu.stock = Math.max(0, menu.stock - line.quantity);
       }
       saveInventory();
 
@@ -586,6 +624,7 @@ function route(req, res) {
         description: item.description,
         image: item.image,
         stock: item.stock,
+        maxStock: MAX_STOCK,
         warning: item.stock <= LOW_STOCK_THRESHOLD
       }))
     });
@@ -595,8 +634,9 @@ function route(req, res) {
     readBody(req).then(body => {
       const user = String(body.username || '').trim();
       const pass = String(body.password || '').trim();
-      if (user !== CHEF_USER || pass !== CHEF_PASSWORD) return sendJson(res, 401, { success: false, message: 'Invalid credentials.' });
-      return sendJson(res, 200, { success: true, token: signToken(), expiresInMs: TOKEN_TTL_MS });
+      const chef = authenticateChef(user, pass);
+      if (!chef) return sendJson(res, 401, { success: false, message: 'Invalid credentials.' });
+      return sendJson(res, 200, { success: true, token: signToken(chef.username), username: chef.username, expiresInMs: TOKEN_TTL_MS });
     }).catch(err => sendJson(res, 400, { success: false, message: err.message }));
     return true;
   }
@@ -663,12 +703,12 @@ function route(req, res) {
       if (!item) return sendJson(res, 404, { success: false, message: 'Item not found.' });
       const amount = Number.isFinite(Number(body.amount)) ? Math.floor(Number(body.amount)) : 10;
       if (amount < 1 || amount > 500) return sendJson(res, 400, { success: false, message: 'Quantity must be between 1 and 500.' });
-      item.stock = Math.min(999, Math.max(0, item.stock + amount));
+      item.stock = Math.min(MAX_STOCK, Math.max(0, item.stock + amount));
       saveInventory();
       sendJson(res, 200, {
         success: true,
         message: `${item.name} restocked by ${amount}. New stock: ${item.stock}.`,
-        item: { id: item.id, name: item.name, category: item.category, price: item.price, prepTime: item.prepTime, description: item.description, image: item.image, stock: item.stock, warning: item.stock <= LOW_STOCK_THRESHOLD }
+        item: { id: item.id, name: item.name, category: item.category, price: item.price, prepTime: item.prepTime, description: item.description, image: item.image, stock: item.stock, maxStock: MAX_STOCK, warning: item.stock <= LOW_STOCK_THRESHOLD }
       });
     }).catch(err => sendJson(res, 400, { success: false, message: err.message }));
     return;
