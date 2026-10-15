@@ -577,6 +577,25 @@ function route(req, res) {
     return true;
   }
 
+  const restockMatch = req.method === 'POST' && url.pathname.match(/^\/api\/chef\/inventory\/([^/]+)\/restock$/);
+  if (restockMatch) {
+    if (!isChef(req)) return sendJson(res, 401, { success: false, message: 'Unauthorized.' });
+    readBody(req).then(body => {
+      const id = decodeURIComponent(restockMatch[1]).trim();
+      const item = MENU.find(x => String(x.id) === id);
+      if (!item) return sendJson(res, 404, { success: false, message: 'Item not found.' });
+      const amount = Number.isFinite(Number(body.amount)) ? Math.floor(Number(body.amount)) : 10;
+      if (amount < 1 || amount > 500) return sendJson(res, 400, { success: false, message: 'Quantity must be between 1 and 500.' });
+      item.stock = Math.min(999, Math.max(0, item.stock + amount));
+      sendJson(res, 200, {
+        success: true,
+        message: `${item.name} restocked by ${amount}. New stock: ${item.stock}.`,
+        item: { id: item.id, name: item.name, category: item.category, price: item.price, prepTime: item.prepTime, description: item.description, image: item.image, stock: item.stock, warning: item.stock <= LOW_STOCK_THRESHOLD }
+      });
+    }).catch(err => sendJson(res, 400, { success: false, message: err.message }));
+    return;
+  }
+
   return sendJson(res, 404, { success: false, message: 'Not Found' });
 }
 
