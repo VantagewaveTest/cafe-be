@@ -1,4 +1,4 @@
-﻿const http = require('http');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const PORT = Number(process.env.PORT || 5000);
 const ORDERS_FILE = path.join(__dirname, 'orders.json');
 const BOOKINGS_FILE = path.join(__dirname, 'bookings.json');
+const INVENTORY_FILE = path.join(__dirname, 'inventory.json');
 const LOW_STOCK_THRESHOLD = 3;
 
 const MENU = [
@@ -33,9 +34,28 @@ const MENU = [
   { id: 's2', name: 'Chicken Caesar Wrap', category: 'Sandwiches', price: 6.25, prepTime: 10, stock: 7, description: 'Wraps of Caesar-grilled chicken, lettuce and parmesan.', image: '\uD83E\uDD6A' }
 ];
 
-const CHEF_USER = process.env.CHEF_USERNAME || 'chef';
-const CHEF_PASSWORD = process.env.CHEF_PASSWORD || 'chef123';
-const TOKEN_SECRET = process.env.CHEF_TOKEN_SECRET || 'cafe-demo-secret-change-me';
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_DEV = NODE_ENV === 'development';
+const DEV_CHEF_USER = 'chef';
+const DEV_CHEF_PASSWORD = 'chef123';
+const DEV_TOKEN_SECRET = 'cafe-demo-secret-change-me';
+const CHEF_USER = process.env.CHEF_USERNAME || (IS_DEV ? DEV_CHEF_USER : '');
+const CHEF_PASSWORD = process.env.CHEF_PASSWORD || (IS_DEV ? DEV_CHEF_PASSWORD : '');
+const TOKEN_SECRET = process.env.CHEF_TOKEN_SECRET || (IS_DEV ? DEV_TOKEN_SECRET : '');
+if (!IS_DEV) {
+  const unsafe =
+    !CHEF_USER || !CHEF_PASSWORD || !TOKEN_SECRET ||
+    CHEF_USER === DEV_CHEF_USER ||
+    CHEF_PASSWORD === DEV_CHEF_PASSWORD ||
+    TOKEN_SECRET === DEV_TOKEN_SECRET;
+  if (unsafe) {
+    console.error('Refusing to start: set CHEF_USERNAME, CHEF_PASSWORD and CHEF_TOKEN_SECRET for non-development environments.');
+    process.exit(1);
+  }
+}
+if (IS_DEV && !process.env.CHEF_PASSWORD) {
+  console.warn('[dev] Using default chef credentials. Override via CHEF_USERNAME/CHEF_PASSWORD/CHEF_TOKEN_SECRET.');
+}
 const TOKEN_TTL_MS = 60 * 60 * 1000;
 
 const TABLES = [
@@ -56,6 +76,7 @@ let bookings = loadJson(BOOKINGS_FILE, []);
 const idempotencyIndex = new Map();
 
 initializeIndex();
+loadInventory();
 
 function loadJson(file, fallback) {
   try {
@@ -77,6 +98,36 @@ function saveJson(file, data) {
 
 function persistOrders() { saveJson(ORDERS_FILE, orders); }
 function persistBookings() { saveJson(BOOKINGS_FILE, bookings); }
+
+function loadInventory() {
+  try {
+    if (fs.existsSync(INVENTORY_FILE)) {
+      const raw = fs.readFileSync(INVENTORY_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && Array.isArray(data.items)) {
+        for (const it of data.items) {
+          const m = MENU.find(x => String(x.id) === String(it.id));
+          if (m && Number.isFinite(Number(it.stock))) {
+            m.stock = Math.max(0, Math.min(999, Number(it.stock)));
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // ignore inventory load errors
+  }
+}
+
+function saveInventory() {
+  try {
+    const data = {
+      items: MENU.map(x => ({ id: x.id, stock: x.stock }))
+    };
+    fs.writeFileSync(INVENTORY_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (_) {
+    // ignore inventory save errors
+  }
+}
 
 function initializeIndex() {
   orders.forEach(order => {
@@ -125,6 +176,31 @@ function verifyToken(token) {
 function getBearer(req) {
   const match = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
   return match ? match[1].trim() : null;
+}
+
+function toChefOrder(order) {
+  if (!order || typeof order !== 'object') return order;
+  return {
+    orderId: order.orderId,
+    tableNumber: order.tableNumber || '',
+    guestName: order.guestName || '',
+    partySize: order.partySize || 0,
+    bookingCode: order.bookingCode || '',
+    items: Array.isArray(order.items) ? order.items.map(i => ({
+      id: i.id || '',
+      name: i.name || '',
+      category: i.category || '',
+      quantity: i.quantity || 0,
+      prepTime: i.prepTime || 0,
+      lineTotal: Number(i.lineTotal) || 0
+    })) : [],
+    status: order.status || '',
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    expectedDeliveredAt: order.expectedDeliveredAt,
+    totalPrepTime: order.totalPrepTime || 0,
+    rejectionReason: order.rejectionReason || ''
+  };
 }
 
 function isChef(req) {
@@ -399,6 +475,7 @@ function route(req, res) {
         const menu = MENU.find(m => m.id === line.id);
         menu.stock -= line.quantity;
       }
+      saveInventory();
 
       const orderId = 'ORD-' + makeId('');
       const order = {
@@ -527,7 +604,7 @@ function route(req, res) {
   if (req.method === 'GET' && url.pathname === '/api/chef/orders') {
     if (!isChef(req)) return sendJson(res, 401, { success: false, message: 'Unauthorized.' });
     const sorted = [...orders].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    return sendJson(res, 200, { success: true, orders: sorted });
+    return sendJson(res, 200, { success: true, orders: sorted.map(toChefOrder) });
   }
 
   const rejectMatch = url.pathname.match(/^\/api\/chef\/orders\/([^/]+)\/reject$/);
@@ -587,6 +664,7 @@ function route(req, res) {
       const amount = Number.isFinite(Number(body.amount)) ? Math.floor(Number(body.amount)) : 10;
       if (amount < 1 || amount > 500) return sendJson(res, 400, { success: false, message: 'Quantity must be between 1 and 500.' });
       item.stock = Math.min(999, Math.max(0, item.stock + amount));
+      saveInventory();
       sendJson(res, 200, {
         success: true,
         message: `${item.name} restocked by ${amount}. New stock: ${item.stock}.`,

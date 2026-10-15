@@ -1,2 +1,4 @@
 node_modules/
 orders.json
+inventory.json
+bookings.json
