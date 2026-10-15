@@ -503,6 +503,11 @@ function route(req, res) {
       items: MENU.map(item => ({
         id: item.id,
         name: item.name,
+        category: item.category,
+        price: item.price,
+        prepTime: item.prepTime,
+        description: item.description,
+        image: item.image,
         stock: item.stock,
         warning: item.stock <= LOW_STOCK_THRESHOLD
       }))
