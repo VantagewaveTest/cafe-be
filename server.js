@@ -326,23 +326,30 @@ function route(req, res) {
   const isStaffLogin = req.method === 'POST' && (url.pathname === '/staff/login' || url.pathname === '/api/staff/login');
   if (isStaffLogin) {
     readBody(req).then(body => {
-      const { username, password, role } = body;
-      if (!username || !password || !role) {
-        return sendJson(res, 400, { success: false, message: 'Username, password and role are required.' });
+      const { username, password, role: clientRole } = body;
+      if (!username || !password) {
+        return sendJson(res, 400, { success: false, message: 'Username and password are required.' });
       }
-      if (role !== 'CHEF' && role !== 'WAITER') {
-        return sendJson(res, 400, { success: false, message: 'Role must be CHEF or WAITER.' });
+
+      // Auto-detect role: check which account list the username exists in
+      // (role is server-verified, never trusted from client)
+      let detectedRole = null;
+      if (authenticateAccount(username, password, 'CHEF')) {
+        detectedRole = 'CHEF';
+      } else if (authenticateAccount(username, password, 'WAITER')) {
+        detectedRole = 'WAITER';
       }
-      const acc = authenticateAccount(username, password, role);
-      if (!acc) {
+
+      if (!detectedRole) {
         return sendJson(res, 401, { success: false, message: 'Invalid credentials.' });
       }
-      const token = signToken(acc.username, role);
+
+      const token = signToken(username, detectedRole);
       return sendJson(res, 200, {
         success: true,
         token,
-        role,
-        username: acc.username,
+        role: detectedRole,
+        username,
         expiresInMs: TOKEN_TTL_MS
       });
     }).catch(err => sendJson(res, 400, { success: false, message: err.message }));
