@@ -463,11 +463,11 @@ function route(req, res) {
       if (!nextStatus || typeof nextStatus !== 'string' || !STATUS_ORDER.includes(nextStatus)) {
         return sendJson(res, 400, { success: false, message: `Invalid status: '${nextStatus || 'undefined'}'. Must be one of ${STATUS_ORDER.join(', ')}.` });
       }
-      if (!VALID_TRANSITIONS[order.status] || !VALID_TRANSITIONS[order.status].has(nextStatus)) {
-        return sendJson(res, 409, { success: false, message: `Cannot move '${order.status}' → '${nextStatus}'.` });
-      }
       if (order.status === nextStatus) {
         return sendJson(res, 200, { success: true, message: `Already ${nextStatus}.`, status: order.status });
+      }
+      if (!VALID_TRANSITIONS[order.status] || !VALID_TRANSITIONS[order.status].has(nextStatus)) {
+        return sendJson(res, 409, { success: false, message: `Cannot move '${order.status}' → '${nextStatus}'.` });
       }
 
       appendStatusHistory(order, order.status, nextStatus, staff.username, reason || 'chef action');
