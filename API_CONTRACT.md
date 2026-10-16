@@ -29,6 +29,14 @@ Allowed headers: `Content-Type, Authorization, X-Order-Token`.
 
 ## Endpoints
 
+### GET /api/health
+**Who:** Public (monitoring / liveness probe). No auth.
+Response `200`:
+```json
+{ "success": true, "status": "ok", "uptimeSeconds": 12,
+  "orders": 0, "activeSessions": 1, "time": "2026-10-16T10:00:00.000Z" }
+```
+
 ### GET /api/menu
 **Who:** Guest (public). Returns server-authored prices. Prices here are the only
 source of truth for checkout.
@@ -191,6 +199,7 @@ All errors use:
 | 403 | Forbidden staff role, or invalid/mismatched guest token |
 | 404 | Unknown order |
 | 409 | Skipped / repeated / invalid status transition |
+| 429 | Too many failed login attempts (rate limited) |
 | 5xx | Persistence or internal failure |
 
 ## Compatibility notes

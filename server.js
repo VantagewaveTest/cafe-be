@@ -3,10 +3,24 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT || 5000);
-const ORDERS_FILE = process.env.ORDERS_FILE || path.join(__dirname, 'orders.json');
-const TAX_RATE = 0.05;
-const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 8 * 60 * 60);
+// Running as the real server (vs. imported by tests). Used to gate process-level
+// concerns (request logging, rate limiting, graceful shutdown) so tests stay fast
+// and deterministic.
+const IS_MAIN = require.main === module;
+
+// ---- Centralized configuration ----
+const config = {
+  port: Number(process.env.PORT || 5000),
+  ordersFile: process.env.ORDERS_FILE || path.join(__dirname, 'orders.json'),
+  taxRate: 0.05,
+  sessionTtlSeconds: Number(process.env.SESSION_TTL_SECONDS || 8 * 60 * 60),
+  sessionSweepMs: Number(process.env.SESSION_SWEEP_MS || 60 * 1000),
+  bodyLimitBytes: Number(process.env.BODY_LIMIT_BYTES || 1e6),
+  shutdownGraceMs: Number(process.env.SHUTDOWN_GRACE_MS || 5000),
+  loginWindowMs: Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000),
+  loginMaxAttempts: Number(process.env.LOGIN_MAX_ATTEMPTS || 10),
+  logRequests: process.env.LOG_REQUESTS !== 'false'
+};
 
 // ---- Trusted server-side menu (single source of truth for pricing) ----
 const menuItems = [
@@ -42,7 +56,6 @@ function normalizeStatus(s) {
 }
 
 // ---- Staff credentials (never committed as secrets). ----
-// Overridable via env for production. Demo defaults below are for local dev only.
 function parseStaffEnv() {
   // Format: STAFF_USERS="chef1:secret:CHEF,waiter1:secret:WAITER"
   const raw = process.env.STAFF_USERS;
@@ -56,16 +69,29 @@ function parseStaffEnv() {
   }
   return map.size ? map : null;
 }
+const usingDefaultCreds = !process.env.STAFF_USERS;
 const staffUsers = parseStaffEnv() || new Map([
   ['chef1', { username: 'chef1', password: 'chef-secret', role: 'CHEF' }],
   ['waiter1', { username: 'waiter1', password: 'waiter-secret', role: 'WAITER' }]
 ]);
 
+// Constant-time comparison to reduce timing-attack leakage on secrets.
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) {
+    // Perform a dummy compare to keep timing roughly uniform, then fail.
+    crypto.timingSafeEqual(ab, ab);
+    return false;
+  }
+  return crypto.timingSafeEqual(ab, bb);
+}
+
 // ---- In-memory sessions (staff tokens) ----
 const sessions = new Map(); // token -> { username, role, expiresAt }
 function createSession(username, role) {
   const token = 'st_' + crypto.randomBytes(24).toString('hex');
-  const expiresAt = Date.now() + SESSION_TTL_SECONDS * 1000;
+  const expiresAt = Date.now() + config.sessionTtlSeconds * 1000;
   sessions.set(token, { username, role, expiresAt });
   return { token, expiresAt };
 }
@@ -76,16 +102,47 @@ function getSession(token) {
   if (Date.now() > s.expiresAt) { sessions.delete(token); return null; }
   return s;
 }
+// Periodically drop expired sessions so the Map doesn't grow unbounded.
+function sweepExpiredSessions() {
+  const now = Date.now();
+  let removed = 0;
+  for (const [token, s] of sessions) {
+    if (now > s.expiresAt) { sessions.delete(token); removed++; }
+  }
+  return removed;
+}
+
+// ---- Login brute-force protection (only active on the real server) ----
+const loginAttempts = new Map(); // key -> { count, resetAt }
+function loginRateKey(ip, username) { return `${ip}|${username}`; }
+function loginRateLimited(key) {
+  if (!IS_MAIN) return false;
+  const now = Date.now();
+  const e = loginAttempts.get(key);
+  if (!e || now > e.resetAt) return false;
+  return e.count >= config.loginMaxAttempts;
+}
+function recordLoginFailure(key) {
+  if (!IS_MAIN) return;
+  const now = Date.now();
+  let e = loginAttempts.get(key);
+  if (!e || now > e.resetAt) { e = { count: 0, resetAt: now + config.loginWindowMs }; loginAttempts.set(key, e); }
+  e.count++;
+}
+function clearLoginFailures(key) { loginAttempts.delete(key); }
+function sweepLoginAttempts() {
+  const now = Date.now();
+  for (const [k, e] of loginAttempts) if (now > e.resetAt) loginAttempts.delete(k);
+}
 
 // ---- Order store with serialized, atomic persistence ----
 let orders = [];
 function loadOrders() {
-  if (!fs.existsSync(ORDERS_FILE)) { orders = []; return; }
+  if (!fs.existsSync(config.ordersFile)) { orders = []; return; }
   try {
-    const raw = fs.readFileSync(ORDERS_FILE, 'utf8');
+    const raw = fs.readFileSync(config.ordersFile, 'utf8');
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
-      // Normalize legacy lowercase statuses in-place without losing data.
       for (const o of parsed) {
         o.status = normalizeStatus(o.status);
         if (!o.statusTimestamps) o.statusTimestamps = {};
@@ -107,10 +164,10 @@ let writeChain = Promise.resolve();
 function saveOrders() {
   const snapshot = JSON.stringify(orders, null, 2);
   writeChain = writeChain.then(() => new Promise((resolve) => {
-    const tmp = ORDERS_FILE + '.tmp';
+    const tmp = config.ordersFile + '.tmp';
     fs.writeFile(tmp, snapshot, (err) => {
       if (err) { console.error('orders.json write failed:', err.message); return resolve(); }
-      fs.rename(tmp, ORDERS_FILE, (err2) => {
+      fs.rename(tmp, config.ordersFile, (err2) => {
         if (err2) console.error('orders.json rename failed:', err2.message);
         resolve();
       });
@@ -141,7 +198,7 @@ function readBody(req) {
     let tooLarge = false;
     req.on('data', chunk => {
       body += chunk;
-      if (body.length > 1e6) { tooLarge = true; req.destroy(); }
+      if (body.length > config.bodyLimitBytes) { tooLarge = true; req.destroy(); }
     });
     req.on('end', () => {
       if (tooLarge) return reject(new Error('Payload too large'));
@@ -154,6 +211,10 @@ function readBody(req) {
 function getHeader(req, name) {
   const v = req.headers[name.toLowerCase()];
   return Array.isArray(v) ? v[0] : v;
+}
+
+function clientIp(req) {
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
 // ---- Auth middleware helpers ----
@@ -195,7 +256,7 @@ function buildOrderFromRequest(payload) {
     });
   }
   subtotal = round2(subtotal);
-  const tax = round2(subtotal * TAX_RATE);
+  const tax = round2(subtotal * config.taxRate);
   const total = round2(subtotal + tax);
 
   const fulfillment = payload.fulfillment === 'counter' ? 'counter' : 'table';
@@ -209,7 +270,8 @@ function buildOrderFromRequest(payload) {
 }
 
 function makeOrderId() {
-  return 'ORD-' + Date.now() + '-' + crypto.randomBytes(2).toString('hex');
+  // Timestamp + extra entropy avoids collisions when two orders share a ms.
+  return 'ORD-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex');
 }
 
 // ---- Field projection for roles ----
@@ -246,204 +308,212 @@ function filterByDate(list, dateStr) {
   return list.filter(o => sameUtcDate(o.createdAt, dateStr));
 }
 
-// ---- Router ----
-async function handleRequest(req, res) {
-  setCors(res);
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname;
-  const method = req.method;
-
-  try {
-    // GET /api/menu
-    if (method === 'GET' && pathname === '/api/menu') {
-      return sendJson(res, 200, { success: true, menu: menuItems });
-    }
-
-    // POST /api/auth/login
-    if (method === 'POST' && pathname === '/api/auth/login') {
-      const body = await readBody(req);
-      let payload = {};
-      try { payload = JSON.parse(body || '{}'); } catch { return sendError(res, 400, 'Invalid JSON payload.'); }
-      const { username, password } = payload || {};
-      if (!username || !password) return sendError(res, 400, 'username and password are required.');
-      const user = staffUsers.get(username);
-      if (!user || user.password !== password) return sendError(res, 401, 'Invalid credentials.');
-      const { token, expiresAt } = createSession(user.username, user.role);
-      return sendJson(res, 200, {
-        success: true, token, role: user.role, username: user.username,
-        expiresIn: Math.round((expiresAt - Date.now()) / 1000)
-      });
-    }
-
-    // POST /api/orders  (guest checkout)
-    if (method === 'POST' && pathname === '/api/orders') {
-      const body = await readBody(req);
-      let payload = {};
-      try { payload = JSON.parse(body || '{}'); } catch { return sendError(res, 400, 'Invalid JSON payload.'); }
-      const built = buildOrderFromRequest(payload || {});
-      if (built.error) return sendError(res, 400, built.error);
-      const b = built.order;
-      const orderId = makeOrderId();
-      const trackingToken = crypto.randomBytes(16).toString('hex');
-      const now = new Date().toISOString();
-      const order = {
-        orderId,
-        trackingToken, // stored, only returned to the owning guest
-        items: b.validated,
-        subtotal: b.subtotal,
-        tax: b.tax,
-        total: b.total,
-        totalPrepTime: b.totalPrepTime,
-        fulfillment: b.fulfillment,
-        tableNumber: b.tableNumber,
-        paymentMethod: b.paymentMethod,
-        paymentStatus: 'SIMULATED',
-        status: 'PENDING',
-        createdAt: now,
-        statusTimestamps: { PENDING: now },
-        actors: {}
-      };
-      orders.push(order);
-      await saveOrders();
-      return sendJson(res, 201, {
-        success: true,
-        orderId,
-        trackingToken,
-        status: order.status,
-        subtotal: order.subtotal,
-        tax: order.tax,
-        total: order.total,
-        totalPrepTime: order.totalPrepTime,
-        message: 'Order placed. Payment is simulated, not charged.'
-      });
-    }
-
-    // GET /api/orders/:orderId  (guest tracking, staff read)
-    if (method === 'GET' && pathname.startsWith('/api/orders/')) {
-      const id = pathname.slice('/api/orders/'.length);
-      const order = findOrder(id);
-      if (!order) return sendError(res, 404, 'Order not found.');
-      // Staff token grants read; otherwise require matching guest tracking token.
-      const auth = getHeader(req, 'authorization') || '';
-      const staffToken = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-      const session = getSession(staffToken);
-      if (session) {
-        return sendJson(res, 200, { success: true, order: orderForStaff(order) });
-      }
-      const guestToken = getHeader(req, 'x-order-token');
-      if (!guestToken) return sendError(res, 401, 'Missing order tracking token.');
-      if (guestToken !== order.trackingToken) return sendError(res, 403, 'Invalid tracking token for this order.');
-      return sendJson(res, 200, { success: true, order: orderForGuest(order) });
-    }
-
-    // GET /api/kitchen/queue  (CHEF)
-    if (method === 'GET' && pathname === '/api/kitchen/queue') {
-      const session = requireStaff(req, res, ['CHEF']);
-      if (!session) return;
-      const pending = orders.filter(o => o.status === 'PENDING').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      const preparing = orders.filter(o => o.status === 'PREPARING').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      return sendJson(res, 200, {
-        success: true,
-        queue: pending.map(orderForStaff),
-        preparing: preparing.map(orderForStaff),
-        counts: { PENDING: pending.length, PREPARING: preparing.length }
-      });
-    }
-
-    // PATCH /api/kitchen/orders/:id/start  (CHEF: PENDING -> PREPARING)
-    if (method === 'PATCH' && /^\/api\/kitchen\/orders\/[^/]+\/start$/.test(pathname)) {
-      const session = requireStaff(req, res, ['CHEF']);
-      if (!session) return;
-      const id = pathname.split('/')[4];
-      return transition(res, id, 'PREPARING', session);
-    }
-
-    // PATCH /api/kitchen/orders/:id/ready  (CHEF: PREPARING -> READY)
-    if (method === 'PATCH' && /^\/api\/kitchen\/orders\/[^/]+\/ready$/.test(pathname)) {
-      const session = requireStaff(req, res, ['CHEF']);
-      if (!session) return;
-      const id = pathname.split('/')[4];
-      return transition(res, id, 'READY', session);
-    }
-
-    // GET /api/kitchen/history?date=
-    if (method === 'GET' && pathname === '/api/kitchen/history') {
-      const session = requireStaff(req, res, ['CHEF']);
-      if (!session) return;
-      const dateStr = url.searchParams.get('date') || undefined;
-      const history = filterByDate(orders, dateStr)
-        .filter(o => o.statusTimestamps && o.statusTimestamps.PREPARING)
-        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      return sendJson(res, 200, { success: true, date: dateStr || null, history: history.map(orderForStaff) });
-    }
-
-    // GET /api/stats/top-prepared?date=
-    if (method === 'GET' && pathname === '/api/stats/top-prepared') {
-      const session = requireStaff(req, res, ['CHEF']);
-      if (!session) return;
-      const dateStr = url.searchParams.get('date') || undefined;
-      const scope = filterByDate(orders, dateStr)
-        .filter(o => o.statusTimestamps && o.statusTimestamps.PREPARING);
-      const totals = new Map();
-      for (const o of scope) {
-        for (const it of o.items) {
-          const cur = totals.get(it.id) || { id: it.id, name: it.name, quantity: 0 };
-          cur.quantity += it.quantity;
-          totals.set(it.id, cur);
-        }
-      }
-      const topPrepared = [...totals.values()].sort((a, b) => b.quantity - a.quantity);
-      return sendJson(res, 200, { success: true, date: dateStr || null, topPrepared });
-    }
-
-    // GET /api/service/orders  (WAITER)
-    if (method === 'GET' && pathname === '/api/service/orders') {
-      const session = requireStaff(req, res, ['WAITER']);
-      if (!session) return;
-      const relevant = orders.filter(o => ['PREPARING', 'READY', 'PICKED_UP'].includes(o.status))
-        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      const counts = { PREPARING: 0, READY: 0, PICKED_UP: 0 };
-      for (const o of relevant) counts[o.status]++;
-      return sendJson(res, 200, { success: true, orders: relevant.map(orderForStaff), counts });
-    }
-
-    // PATCH /api/service/orders/:id/pickup  (WAITER: READY -> PICKED_UP)
-    if (method === 'PATCH' && /^\/api\/service\/orders\/[^/]+\/pickup$/.test(pathname)) {
-      const session = requireStaff(req, res, ['WAITER']);
-      if (!session) return;
-      const id = pathname.split('/')[4];
-      return transition(res, id, 'PICKED_UP', session);
-    }
-
-    // PATCH /api/service/orders/:id/serve  (WAITER: PICKED_UP -> SERVED)
-    if (method === 'PATCH' && /^\/api\/service\/orders\/[^/]+\/serve$/.test(pathname)) {
-      const session = requireStaff(req, res, ['WAITER']);
-      if (!session) return;
-      const id = pathname.split('/')[4];
-      return transition(res, id, 'SERVED', session);
-    }
-
-    // GET /api/service/history?date=
-    if (method === 'GET' && pathname === '/api/service/history') {
-      const session = requireStaff(req, res, ['WAITER']);
-      if (!session) return;
-      const dateStr = url.searchParams.get('date') || undefined;
-      const history = filterByDate(orders, dateStr)
-        .filter(o => o.statusTimestamps && o.statusTimestamps.SERVED)
-        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-      return sendJson(res, 200, { success: true, date: dateStr || null, history: history.map(orderForStaff) });
-    }
-
-    return sendError(res, 404, 'Not Found');
-  } catch (err) {
-    console.error('Unhandled error:', err);
-    return sendError(res, 500, 'Internal server error.');
-  }
+// ---- Route handlers ----
+async function handlerHealth(req, res) {
+  // Lightweight liveness/readiness probe for monitoring and load balancers.
+  sendJson(res, 200, {
+    success: true,
+    status: 'ok',
+    uptimeSeconds: Math.round(process.uptime()),
+    orders: orders.length,
+    activeSessions: sessions.size,
+    time: new Date().toISOString()
+  });
 }
 
-function transition(res, id, targetStatus, session) {
+async function handlerMenu(req, res) {
+  sendJson(res, 200, { success: true, menu: menuItems });
+}
+
+async function handlerLogin(req, res, ctx) {
+  const body = await readBody(req);
+  let payload = {};
+  try { payload = JSON.parse(body || '{}'); } catch { return sendError(res, 400, 'Invalid JSON payload.'); }
+  const { username, password } = payload || {};
+  if (!username || !password) return sendError(res, 400, 'username and password are required.');
+
+  const rateKey = loginRateKey(clientIp(req), username);
+  if (loginRateLimited(rateKey)) {
+    return sendError(res, 429, 'Too many login attempts. Please try again later.');
+  }
+
+  const user = staffUsers.get(username);
+  if (!user || !safeEqual(user.password, password)) {
+    recordLoginFailure(rateKey);
+    return sendError(res, 401, 'Invalid credentials.');
+  }
+  clearLoginFailures(rateKey);
+  const { token, expiresAt } = createSession(user.username, user.role);
+  return sendJson(res, 200, {
+    success: true, token, role: user.role, username: user.username,
+    expiresIn: Math.round((expiresAt - Date.now()) / 1000)
+  });
+}
+
+async function handlerCreateOrder(req, res) {
+  const body = await readBody(req);
+  let payload = {};
+  try { payload = JSON.parse(body || '{}'); } catch { return sendError(res, 400, 'Invalid JSON payload.'); }
+  const built = buildOrderFromRequest(payload || {});
+  if (built.error) return sendError(res, 400, built.error);
+  const b = built.order;
+  const orderId = makeOrderId();
+  const trackingToken = crypto.randomBytes(16).toString('hex');
+  const now = new Date().toISOString();
+  const order = {
+    orderId,
+    trackingToken, // stored, only returned to the owning guest
+    items: b.validated,
+    subtotal: b.subtotal,
+    tax: b.tax,
+    total: b.total,
+    totalPrepTime: b.totalPrepTime,
+    fulfillment: b.fulfillment,
+    tableNumber: b.tableNumber,
+    paymentMethod: b.paymentMethod,
+    paymentStatus: 'SIMULATED',
+    status: 'PENDING',
+    createdAt: now,
+    statusTimestamps: { PENDING: now },
+    actors: {}
+  };
+  orders.push(order);
+  await saveOrders();
+  return sendJson(res, 201, {
+    success: true,
+    orderId,
+    trackingToken,
+    status: order.status,
+    subtotal: order.subtotal,
+    tax: order.tax,
+    total: order.total,
+    totalPrepTime: order.totalPrepTime,
+    message: 'Order placed. Payment is simulated, not charged.'
+  });
+}
+
+async function handlerGetOrder(req, res, ctx) {
+  const id = ctx.params.id;
+  const order = findOrder(id);
+  if (!order) return sendError(res, 404, 'Order not found.');
+  // Staff token grants read; otherwise require matching guest tracking token.
+  const auth = getHeader(req, 'authorization') || '';
+  const staffToken = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const session = getSession(staffToken);
+  if (session) {
+    return sendJson(res, 200, { success: true, order: orderForStaff(order) });
+  }
+  const guestToken = getHeader(req, 'x-order-token');
+  if (!guestToken) return sendError(res, 401, 'Missing order tracking token.');
+  if (!safeEqual(guestToken, order.trackingToken)) return sendError(res, 403, 'Invalid tracking token for this order.');
+  return sendJson(res, 200, { success: true, order: orderForGuest(order) });
+}
+
+async function handlerKitchenQueue(req, res) {
+  const session = requireStaff(req, res, ['CHEF']);
+  if (!session) return;
+  const pending = orders.filter(o => o.status === 'PENDING').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const preparing = orders.filter(o => o.status === 'PREPARING').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  return sendJson(res, 200, {
+    success: true,
+    queue: pending.map(orderForStaff),
+    preparing: preparing.map(orderForStaff),
+    counts: { PENDING: pending.length, PREPARING: preparing.length }
+  });
+}
+
+async function handlerKitchenStart(req, res, ctx) {
+  const session = requireStaff(req, res, ['CHEF']);
+  if (!session) return;
+  return transition(res, ctx.params.id, 'PREPARING', session);
+}
+
+async function handlerKitchenReady(req, res, ctx) {
+  const session = requireStaff(req, res, ['CHEF']);
+  if (!session) return;
+  return transition(res, ctx.params.id, 'READY', session);
+}
+
+async function handlerKitchenHistory(req, res, ctx) {
+  const session = requireStaff(req, res, ['CHEF']);
+  if (!session) return;
+  const dateStr = ctx.url.searchParams.get('date') || undefined;
+  const history = filterByDate(orders, dateStr)
+    .filter(o => o.statusTimestamps && o.statusTimestamps.PREPARING)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  return sendJson(res, 200, { success: true, date: dateStr || null, history: history.map(orderForStaff) });
+}
+
+async function handlerTopPrepared(req, res, ctx) {
+  const session = requireStaff(req, res, ['CHEF']);
+  if (!session) return;
+  const dateStr = ctx.url.searchParams.get('date') || undefined;
+  const scope = filterByDate(orders, dateStr)
+    .filter(o => o.statusTimestamps && o.statusTimestamps.PREPARING);
+  const totals = new Map();
+  for (const o of scope) {
+    for (const it of o.items) {
+      const cur = totals.get(it.id) || { id: it.id, name: it.name, quantity: 0 };
+      cur.quantity += it.quantity;
+      totals.set(it.id, cur);
+    }
+  }
+  const topPrepared = [...totals.values()].sort((a, b) => b.quantity - a.quantity);
+  return sendJson(res, 200, { success: true, date: dateStr || null, topPrepared });
+}
+
+async function handlerServiceOrders(req, res) {
+  const session = requireStaff(req, res, ['WAITER']);
+  if (!session) return;
+  const relevant = orders.filter(o => ['PREPARING', 'READY', 'PICKED_UP'].includes(o.status))
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const counts = { PREPARING: 0, READY: 0, PICKED_UP: 0 };
+  for (const o of relevant) counts[o.status]++;
+  return sendJson(res, 200, { success: true, orders: relevant.map(orderForStaff), counts });
+}
+
+async function handlerServicePickup(req, res, ctx) {
+  const session = requireStaff(req, res, ['WAITER']);
+  if (!session) return;
+  return transition(res, ctx.params.id, 'PICKED_UP', session);
+}
+
+async function handlerServiceServe(req, res, ctx) {
+  const session = requireStaff(req, res, ['WAITER']);
+  if (!session) return;
+  return transition(res, ctx.params.id, 'SERVED', session);
+}
+
+async function handlerServiceHistory(req, res, ctx) {
+  const session = requireStaff(req, res, ['WAITER']);
+  if (!session) return;
+  const dateStr = ctx.url.searchParams.get('date') || undefined;
+  const history = filterByDate(orders, dateStr)
+    .filter(o => o.statusTimestamps && o.statusTimestamps.SERVED)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  return sendJson(res, 200, { success: true, date: dateStr || null, history: history.map(orderForStaff) });
+}
+
+// ---- Route table ----
+const routes = [
+  { method: 'GET', pattern: /^\/api\/health$/, handler: handlerHealth },
+  { method: 'GET', pattern: /^\/api\/menu$/, handler: handlerMenu },
+  { method: 'POST', pattern: /^\/api\/auth\/login$/, handler: handlerLogin },
+  { method: 'POST', pattern: /^\/api\/orders$/, handler: handlerCreateOrder },
+  { method: 'GET', pattern: /^\/api\/orders\/([^/]+)$/, handler: handlerGetOrder, param: 'id' },
+  { method: 'GET', pattern: /^\/api\/kitchen\/queue$/, handler: handlerKitchenQueue },
+  { method: 'PATCH', pattern: /^\/api\/kitchen\/orders\/([^/]+)\/start$/, handler: handlerKitchenStart, param: 'id' },
+  { method: 'PATCH', pattern: /^\/api\/kitchen\/orders\/([^/]+)\/ready$/, handler: handlerKitchenReady, param: 'id' },
+  { method: 'GET', pattern: /^\/api\/kitchen\/history$/, handler: handlerKitchenHistory },
+  { method: 'GET', pattern: /^\/api\/stats\/top-prepared$/, handler: handlerTopPrepared },
+  { method: 'GET', pattern: /^\/api\/service\/orders$/, handler: handlerServiceOrders },
+  { method: 'PATCH', pattern: /^\/api\/service\/orders\/([^/]+)\/pickup$/, handler: handlerServicePickup, param: 'id' },
+  { method: 'PATCH', pattern: /^\/api\/service\/orders\/([^/]+)\/serve$/, handler: handlerServiceServe, param: 'id' },
+  { method: 'GET', pattern: /^\/api\/service\/history$/, handler: handlerServiceHistory }
+];
+
+// ---- Status transition (durable: persists before responding) ----
+async function transition(res, id, targetStatus, session) {
   const order = findOrder(id);
   if (!order) return sendError(res, 404, 'Order not found.');
   const expected = NEXT_STATUS[order.status];
@@ -454,16 +524,87 @@ function transition(res, id, targetStatus, session) {
   order.status = targetStatus;
   order.statusTimestamps[targetStatus] = now;
   order.actors[targetStatus] = session.username;
-  saveOrders();
+  await saveOrders(); // persist before responding so a crash can't lose it
   return sendJson(res, 200, { success: true, order: orderForStaff(order) });
+}
+
+// ---- Router ----
+async function handleRequest(req, res) {
+  setCors(res);
+  const start = process.hrtime.bigint();
+  const requestId = crypto.randomUUID();
+  res.setHeader('X-Request-Id', requestId);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    if (IS_MAIN && config.logRequests) logRequest(req, res, start, requestId);
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+
+  try {
+    for (const r of routes) {
+      if (r.method !== req.method) continue;
+      const m = pathname.match(r.pattern);
+      if (!m) continue;
+      const ctx = { url, params: {} };
+      if (r.param) ctx.params[r.param] = decodeURIComponent(m[1]);
+      await r.handler(req, res, ctx);
+      if (IS_MAIN && config.logRequests) logRequest(req, res, start, requestId);
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+  } catch (err) {
+    console.error(`[${requestId}] Unhandled error:`, err);
+    if (!res.headersSent) sendError(res, 500, 'Internal server error.');
+  }
+  if (IS_MAIN && config.logRequests) logRequest(req, res, start, requestId);
+}
+
+function logRequest(req, res, start, requestId) {
+  const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+  console.log(`[${requestId}] ${req.method} ${req.url} -> ${res.statusCode} (${durationMs.toFixed(1)}ms)`);
+}
+
+// ---- Graceful shutdown ----
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n${signal} received. Flushing pending writes and shutting down...`);
+  if (sessionSweeper) clearInterval(sessionSweeper);
+  if (attemptSweeper) clearInterval(attemptSweeper);
+  server.close(async () => {
+    try { await writeChain; } catch (e) { /* best-effort flush */ }
+    console.log('Shutdown complete.');
+    process.exit(0);
+  });
+  // Force exit if connections don't close in time.
+  setTimeout(() => { console.log('Forcing shutdown after grace period.'); process.exit(0); }, config.shutdownGraceMs).unref();
 }
 
 const server = http.createServer((req, res) => { handleRequest(req, res); });
 
-if (require.main === module) {
+// Background sweepers (created here, cleared on shutdown).
+const sessionSweeper = setInterval(sweepExpiredSessions, config.sessionSweepMs);
+sessionSweeper.unref();
+const attemptSweeper = setInterval(sweepLoginAttempts, config.loginWindowMs);
+attemptSweeper.unref();
+
+if (IS_MAIN) {
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
   loadOrders();
-  server.listen(PORT, () => {
-    console.log(`Cafe backend running on http://localhost:${PORT}`);
+  if (usingDefaultCreds) {
+    console.warn('WARNING: Using default demo staff credentials. Set STAFF_USERS before running in production.');
+  }
+  server.listen(config.port, () => {
+    console.log(`Cafe backend running on http://localhost:${config.port}`);
+    console.log(`Health check: http://localhost:${config.port}/api/health`);
   });
 }
 
@@ -472,5 +613,6 @@ module.exports = {
   // Test hooks: flush pending writes and reload from disk (simulates restart).
   _flush: () => writeChain,
   _reload: () => { loadOrders(); return orders; },
-  _state: { sessions }
+  _state: { sessions },
+  _config: config
 };

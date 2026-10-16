@@ -228,6 +228,14 @@ test('date-filtered history and top-prepared stats', async () => {
   assert.strictEqual(future.json.history.length, 0);
 });
 
+test('health endpoint reports ok and order count', async () => {
+  const r = await request('GET', '/api/health');
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.status, 'ok');
+  assert.strictEqual(typeof r.json.orders, 'number');
+  assert.ok(r.json.time, 'reports server time');
+});
+
 test('CORS preflight and PATCH support', async () => {
   const r = await new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: '/api/orders', method: 'OPTIONS' }, res => {

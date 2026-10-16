@@ -20,6 +20,12 @@ Environment variables (all optional, with local-demo defaults):
 | `ORDERS_FILE` | `./orders.json` | Where orders are persisted |
 | `STAFF_USERS` | dev defaults | `user:pass:ROLE,...` staff credentials |
 | `SESSION_TTL_SECONDS` | `28800` | Staff session lifetime |
+| `SESSION_SWEEP_MS` | `60000` | How often expired sessions are purged |
+| `BODY_LIMIT_BYTES` | `1000000` | Max request body size |
+| `LOGIN_WINDOW_MS` | `900000` | Failed-login rate-limit window |
+| `LOGIN_MAX_ATTEMPTS` | `10` | Failed logins before 429 |
+| `SHUTDOWN_GRACE_MS` | `5000` | Grace period before forced exit on shutdown |
+| `LOG_REQUESTS` | `true` | Set `false` to disable per-request logging |
 
 **Staff credentials:** for local demo the server seeds `chef1:chef-secret` (CHEF)
 and `waiter1:waiter-secret` (WAITER). For anything non-local, set `STAFF_USERS`
@@ -33,6 +39,7 @@ See **[API_CONTRACT.md](./API_CONTRACT.md)** for the full contract shared with
 error codes.
 
 Quick reference:
+- `GET /api/health` — liveness/health probe (public).
 - `GET /api/menu` — public menu (server-authored prices).
 - `POST /api/orders` — guest checkout; server-side pricing + 5% tax; returns
   `orderId`, `trackingToken`, totals, `PENDING`.
@@ -61,7 +68,8 @@ rejection, malformed JSON, staff auth (401) and role boundaries (403), guest
 tracking isolation, the full lifecycle with actor/timestamp recording, invalid
 transitions (409), FIFO ordering with concurrent PREPARING, persistence and
 restart recovery, legacy lowercase `pending` compatibility, date-filtered
-history, top-prepared statistics, and CORS/PATCH support.
+history, top-prepared statistics, the health endpoint, and CORS/PATCH support.
+(14 tests.)
 
 ## Persistence & concurrency
 
@@ -70,6 +78,29 @@ applied atomically (temp file + rename) so concurrent updates don't silently
 overwrite each other and a crash mid-write can't corrupt the file. Orders and
 status history survive server restarts. On load, any legacy lowercase `"pending"`
 status is normalized to `PENDING` without losing saved data.
+
+## Operational notes
+
+The server process is built for safe, observable operation:
+
+- **Durable transitions:** every status change is written to disk *before* the
+  response is returned, so a crash can't lose a confirmed transition.
+- **Graceful shutdown:** on `SIGINT`/`SIGTERM` the server stops accepting
+  connections, flushes any pending writes, and exits cleanly (with a forced-exit
+  fallback after `SHUTDOWN_GRACE_MS`).
+- **Health check:** `GET /api/health` reports status, uptime, order count, and
+  active sessions for monitoring / load balancers.
+- **Request logging:** each request is logged with a request ID, method, path,
+  status code, and duration; the ID is also returned in the `X-Request-Id`
+  header. Disable with `LOG_REQUESTS=false`.
+- **Session hygiene:** expired staff sessions and stale login-rate-limit buckets
+  are swept periodically so memory doesn't grow unbounded.
+- **Login brute-force protection:** repeated failed logins per user/IP are
+  throttled (`429` after `LOGIN_MAX_ATTEMPTS` within `LOGIN_WINDOW_MS`).
+- **Timing-safe comparisons:** staff passwords and guest tracking tokens are
+  compared with `crypto.timingSafeEqual` to reduce timing-attack leakage.
+- **Startup warning:** running with the default demo credentials logs a warning
+  to set `STAFF_USERS` before production.
 
 ## Known limitations
 
