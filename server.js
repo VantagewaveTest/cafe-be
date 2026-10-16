@@ -575,12 +575,14 @@ function route(req, res) {
 
     const preparing = orders.filter(o => o.status === 'PREPARING');
     const ready = orders.filter(o => o.status === 'READY');
+    const pickedUp = orders.filter(o => o.status === 'PICKED_UP');
 
     return sendJson(res, 200, {
       success: true,
       preparing: preparing.map(o => toPublicOrder(o, 'WAITER', false)),
       ready: ready.map(o => toPublicOrder(o, 'WAITER', false)),
-      counts: { preparing: preparing.length, ready: ready.length }
+      pickedUp: pickedUp.map(o => toPublicOrder(o, 'WAITER', false)),
+      counts: { preparing: preparing.length, ready: ready.length, pickedUp: pickedUp.length }
     });
   }
 
