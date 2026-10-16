@@ -322,8 +322,9 @@ function route(req, res) {
     return sendJson(res, 200, { success: true, menu: MENU });
   }
 
-  // ---- POST /staff/login ----
-  if (req.method === 'POST' && url.pathname === '/staff/login') {
+  // ---- POST /staff/login (also /api/staff/login for frontend API_BASE compatibility) ----
+  const isStaffLogin = req.method === 'POST' && (url.pathname === '/staff/login' || url.pathname === '/api/staff/login');
+  if (isStaffLogin) {
     readBody(req).then(body => {
       const { username, password, role } = body;
       if (!username || !password || !role) {
