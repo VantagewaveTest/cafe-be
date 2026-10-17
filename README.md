@@ -45,6 +45,9 @@ Coverage map:
 | `test/persistence.test.js` | Two back-to-back orders persist, restart keeps status/timestamps/actors, corrupt store recovered, legacy `pending` migrated, atomic writes leave no temp file |
 | `test/history.test.js` | Date-filtered kitchen/service history, top-prepared by completed quantity, bad date → 400 |
 
+Recorded results: [`TEST_RESULTS.md`](./TEST_RESULTS.md) · live demo:
+[`DEMO.md`](./DEMO.md) · one-command demo: `node scripts/demo.js`.
+
 ## Layout
 
 ```
@@ -54,6 +57,7 @@ menu.js        menuItems (single pricing source) + server-side pricing/validatio
 auth.js        staff credentials, bearer sessions, role checks
 transitions.js the four legal status moves and who may make them
 orders.js      order store (atomic writes, recovery, migration), queries, views
+scripts/demo.js  live, mock-free walkthrough of the whole lifecycle
 test/          node:test suite
 ```
 
